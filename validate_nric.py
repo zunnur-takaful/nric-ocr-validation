@@ -59,18 +59,10 @@ CHIP_EDGE_VARIANCE_THRESHOLD = 200.0
 # center-right, small ghost photo bottom-right). Boxes are (x0,y0,x1,y1) as
 # fractions of the front-side crop, chosen to dodge both photos.
 FRONT_TEXT_ROI = {
-    "gen6": (0.00, 0.12, 0.58, 0.85),
+    "gen6": (0.00, 0.12, 0.58, 0.97),  # y1 was 0.85, which clipped a wrapped address line on samples/OIP_5.webp (sat at y=0.849)
     "gen7": (0.16, 0.26, 0.85, 0.92),
 }
 OLD_GEN_KEYWORDS = ("TOUCH", "MEPS", "CASH", "ATM")
-
-
-def largest_card_contour(gray):
-    edged = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    return max(contours, key=cv2.contourArea)
 
 
 def _score_vs_threshold(value, threshold):
@@ -80,17 +72,24 @@ def _score_vs_threshold(value, threshold):
 
 
 def check_aspect_ratio(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    contour = largest_card_contour(gray)
-    if contour is None:
-        return {"detected": False, "ratio": None, "expected": round(CARD_ASPECT_RATIO, 3), "pass": False, "score": 0.0}
-    (_, _), (w, h), _ = cv2.minAreaRect(contour)
-    if w == 0 or h == 0:
-        return {"detected": False, "ratio": None, "expected": round(CARD_ASPECT_RATIO, 3), "pass": False, "score": 0.0}
+    """ponytail: just the whole image's ratio, no Canny contour search. Contour
+    detection was for finding the card inside a messy/padded photo -- now that
+    the front-end is responsible for cropping to just the card (see README),
+    that problem doesn't exist, and the old approach was unreliable anyway
+    (it failed on every sample tested in this project, finding some inner
+    edge instead of the card boundary)."""
+    h, w = image.shape[:2]
     ratio = float(max(w, h) / min(w, h))
-    passed = abs(ratio - CARD_ASPECT_RATIO) <= ASPECT_TOLERANCE
-    score = round(100.0 * min(ratio, CARD_ASPECT_RATIO) / max(ratio, CARD_ASPECT_RATIO), 1)
-    return {"detected": True, "ratio": round(ratio, 3), "expected": round(CARD_ASPECT_RATIO, 3), "pass": bool(passed), "score": score}
+    deviation = abs(ratio - CARD_ASPECT_RATIO)
+    passed = deviation <= ASPECT_TOLERANCE
+    # ponytail: plain ratio/expected proportion (tried first) decayed too
+    # slowly to mean anything -- samples/OIP_1.webp (ratio 1.259 vs. 1.585,
+    # well outside tolerance) still scored 79.5. Anchoring to ASPECT_TOLERANCE
+    # instead gives 100 at a perfect match, exactly 50 right at the pass/fail
+    # boundary, and keeps dropping (never hitting a hard floor) the further
+    # off it gets -- so "above ~50" roughly tracks "passes".
+    score = round(100.0 * ASPECT_TOLERANCE / (ASPECT_TOLERANCE + deviation), 1)
+    return {"ratio": round(ratio, 3), "expected": round(CARD_ASPECT_RATIO, 3), "pass": bool(passed), "score": score}
 
 
 def check_blur(image):
@@ -367,18 +366,39 @@ def validate_image(path, side_override=None):
         text, ocr_accuracy, fields = ocr_and_parse(image)
     generation = classify_generation(classification["side"], image, text)
 
+    # ponytail: a fixed watermark keyword list can never cover arbitrary
+    # custom text (e.g. "FOR TAKAFUL USAGE ONLY"), so don't try to guess
+    # phrases -- OCR the whole image (not just the name/address ROI, which
+    # deliberately dodges part of the card) and hand the raw text to a human
+    # to eyeball for anything that shouldn't be there.
+    raw_text, _ = run_ocr(image, target_width=1800)
+
     aspect = check_aspect_ratio(image)
     blur = check_blur(image)
     color = check_color(image)
 
-    # ponytail: same signals the old pass/fail gate ANDed, now scored instead
-    # of all-or-nothing -- a near-miss (e.g. one soft-fail check) reads very
-    # differently from a photo that fails everything, which a boolean hides.
-    # No watermark check here -- reject those earlier as a front-end upload
-    # rule instead (plain-text OCR keyword matching never caught the stylized
-    # logo watermarks that actually matter anyway).
-    passed_checks = (aspect["pass"], blur["pass"], color["pass"], fields["nric_number"] is not None, fields["nric_date_valid"])
-    score = round(100 * sum(passed_checks) / len(passed_checks), 1)
+    # ponytail: average of each check's own 0-100 score, not a pass/fail tally
+    # -- a tally only has as many distinct values as there are checks (every
+    # photo failing just the aspect ratio landed on the same 80.0 regardless
+    # of how close it actually was), which hides real differences the sub-
+    # scores already capture. NRIC found/date-valid have no natural continuous
+    # measure, so they're binary 100/0 inputs to the same average. No
+    # watermark check here -- reject those earlier as a front-end upload rule
+    # instead (plain-text OCR keyword matching never caught the stylized logo
+    # watermarks that actually matter anyway).
+    sub_scores = (
+        aspect["score"], blur["score"], color["score"],
+        100.0 if fields["nric_number"] is not None else 0.0,
+        100.0 if fields["nric_date_valid"] else 0.0,
+    )
+    score = round(sum(sub_scores) / len(sub_scores), 1)
+    # ponytail: aspect ratio is the "is this even a properly cropped card"
+    # signal, not just another input to average in -- a bad crop shouldn't be
+    # maskable by four perfect unrelated scores (seen on samples/OIP_1.webp:
+    # aspect_score 35.6 but a 87.1 blended average). Gate it: the overall
+    # score can't exceed aspect_ratio's own score once it fails.
+    if not aspect["pass"]:
+        score = round(min(score, aspect["score"]), 1)
 
     return {
         "file": str(path),
@@ -387,6 +407,7 @@ def validate_image(path, side_override=None):
         "nric_number": fields["nric_number"],
         "nric_date_valid": fields["nric_date_valid"],
         "text": fields["text"],
+        "raw_text": raw_text,
         "ocr_accuracy": ocr_accuracy,
         "checks": {
             "side_confidence": {
