@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Self-check for validate_nric.py heuristics. Needs samples/OIP_6.jpg for the
+template-matching checks (synthetic images can't stand in for real card art)."""
+import cv2
+import numpy as np
+
+from validate_nric import (
+    check_blur,
+    check_color,
+    classify_generation,
+    classify_side,
+    is_valid_nric_date,
+    parse_fields,
+    validate_image,
+)
+
+sharp = np.zeros((200, 200, 3), dtype=np.uint8)
+sharp[::2, :] = 255  # stripes -> high Laplacian variance
+assert check_blur(sharp)["pass"] is True
+
+blurry = np.full((200, 200, 3), 128, dtype=np.uint8)
+assert check_blur(blurry)["pass"] is False
+
+colorful = np.zeros((50, 50, 3), dtype=np.uint8)
+colorful[:, :, 2] = 255  # pure red -> high saturation
+assert check_color(colorful)["pass"] is True
+
+gray = np.full((50, 50, 3), 128, dtype=np.uint8)
+assert check_color(gray)["pass"] is False
+
+assert is_valid_nric_date("900115") is True
+assert is_valid_nric_date("901332") is False
+
+fields = parse_fields("WARGANEGARA\n900115-14-5523\nAHMAD BIN ALI\nNO 12 JALAN BUNGA\n50000 KUALA LUMPUR")
+assert fields["nric_number"] == "900115-14-5523"
+assert fields["nric_date_valid"] is True
+assert "AHMAD BIN ALI" in fields["text"]
+assert "JALAN BUNGA" in fields["text"]
+
+gen6 = cv2.imread("samples/OIP_6.jpg")
+h, w = gen6.shape[:2]
+front_bgr = gen6[:, : w // 2]
+back_bgr = gen6[:, w // 2 :]
+
+front_cls = classify_side(front_bgr)
+assert front_cls["side"] == "front", front_cls
+back_cls = classify_side(back_bgr)
+assert back_cls["side"] == "back", back_cls
+
+assert classify_generation("front", front_bgr, "") == "gen6"  # chip on front
+assert classify_generation("back", back_bgr, "TOUCH N GO ATM 64K chip MEPS CASH") == "gen6"
+
+# --side override must win over the auto-classifier, even on an actual front
+# crop forced to "back".
+result = validate_image("samples/OIP_1.webp", side_override="back")
+assert result["side"] == "back", result
+
+# a genuine front+back-in-one-photo upload must be rejected, not split.
+result = validate_image("samples/OIP_6.jpg")
+assert "error" in result, result
+
+print("OK")
