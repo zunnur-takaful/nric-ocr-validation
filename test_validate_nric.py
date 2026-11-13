@@ -62,12 +62,28 @@ result = validate_image("samples/OIP_6.jpg")
 assert "error" in result, result
 
 assert match_expected_ic_no("900115-14-5523", "900115145523")["match"] is True  # separators shouldn't matter
-assert match_expected_ic_no("900115-14-5523", "900115-14-5529")["match"] is False
-assert match_expected_ic_no("900115-14-5523", "900115-14-5529")["score"] > 80  # still close, just one digit off
+mismatch = match_expected_ic_no("900115-14-5523", "900115-14-5529")
+assert mismatch["match"] is False
+assert mismatch["score"] > 80  # still close, just one digit off
+assert mismatch["differences"] == [{"expected": "9", "actual": "3"}], mismatch  # names the exact digit that differs
 
 name = match_expected_name("AHMAD BIN ALI / NO 12 JALAN BUNGA", "Ahmad Bin Ali")
 assert name["best_match_line"] == "AHMAD BIN ALI", name
 assert name["score"] > 95, name
+assert name["match"] is True, name
+assert name["differences"] == [], name  # exact match once normalized -> nothing to report
+
+# punctuation (OCR noise or a legitimate symbol like "'" / "A/L") must not cost match score.
+noisy = match_expected_name("NURINA SAKINAH BINT! ANUAR / KEPONG", "Nurina Sakinah Binti Anuar")
+assert noisy["match"] is True, noisy
+slashed = match_expected_name("AHMAD A/L BAKAR / NO 1 JALAN", "Ahmad A/L Bakar")
+assert slashed["best_match_line"] == "AHMAD A/L BAKAR", slashed  # split on " / ", not bare "/"
+assert slashed["match"] is True, slashed
+
+# a genuinely different name should be flagged, with the differing part surfaced.
+wrong = match_expected_name("JOHN WICK / KAMPUNG MASJID", "John Smith")
+assert wrong["match"] is False, wrong
+assert wrong["differences"], wrong  # non-empty -- something concrete to point at, not just a low score
 
 # end to end: validate_image should surface the same thing under "match".
 result = validate_image("samples/sample.jpg", expected_name="Ahmad Bin Ali", expected_ic_no="900115145523")

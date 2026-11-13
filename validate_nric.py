@@ -16,6 +16,7 @@ CARD_ASPECT_RATIO = 85.60 / 54.00  # CR80 ID card standard
 ASPECT_TOLERANCE = 0.18
 BLUR_VARIANCE_THRESHOLD = 100.0
 SATURATION_THRESHOLD = 15.0  # mean HSV saturation below this ~= grayscale
+NAME_MATCH_THRESHOLD = 90.0  # at/above counts as a match despite OCR noise (punctuation, a misread char); below is likely a different name
 NRIC_RE = re.compile(r"(\d{6})[\s.\-–—]?(\d{2})[\s.\-–—]?(\d{4})")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 OCR_MIN_WIDTH = 1200  # upscale crops below this so small combined/cropped uploads stay readable
@@ -352,6 +353,18 @@ def _similarity(a, b):
     return round(100.0 * difflib.SequenceMatcher(None, a, b).ratio(), 1)
 
 
+def _diff_fragments(actual, expected):
+    """Where two strings differ, from difflib opcodes -- the *why* behind a
+    low score, not just the number. Each entry is a {expected, actual}
+    fragment; None means that side has nothing there (a straight insertion
+    or deletion rather than a substitution)."""
+    diffs = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, actual, expected).get_opcodes():
+        if tag != "equal":
+            diffs.append({"expected": expected[j1:j2] or None, "actual": actual[i1:i2] or None})
+    return diffs
+
+
 def match_expected_ic_no(nric_number, expected_ic_no):
     actual_digits = re.sub(r"\D", "", nric_number or "")
     expected_digits = re.sub(r"\D", "", expected_ic_no)
@@ -359,20 +372,40 @@ def match_expected_ic_no(nric_number, expected_ic_no):
         "expected": expected_ic_no, "actual": nric_number,
         "score": _similarity(actual_digits, expected_digits),
         "match": bool(actual_digits) and actual_digits == expected_digits,
+        "differences": _diff_fragments(actual_digits, expected_digits),
     }
+
+
+def _normalize_name(s):
+    """Upper-case, collapse any run of non-alphanumeric characters (OCR noise
+    like "!", or a legitimate symbol like "'" in O'Brien or "/" in "A/L") to a
+    single space, so punctuation differences never cost match score -- only
+    actual letter/word differences should."""
+    return " ".join(re.sub(r"[^A-Z0-9]+", " ", s.upper()).split())
 
 
 def match_expected_name(text, expected_name):
     # ponytail: `text` merges name+address with no layout model to split them
     # (see parse_fields), so compare line-by-line and take the best match
-    # instead of fuzzy-matching the whole blob against just the name.
-    lines = [l.strip() for l in (text or "").split("/")]
-    best_line, best_score = None, 0.0
+    # instead of fuzzy-matching the whole blob against just the name. Split on
+    # " / " (parse_fields' actual join delimiter, with spaces), not bare "/" --
+    # a name can contain an unspaced slash itself (e.g. "AHMAD A/L BAKAR",
+    # the common Malaysian "son of" notation), which bare "/" would fracture.
+    lines = [l.strip() for l in (text or "").split(" / ")]
+    norm_expected = _normalize_name(expected_name)
+    best_line, best_score, best_norm = None, 0.0, ""
     for line in lines:
-        score = _similarity(line.upper(), expected_name.upper())
+        norm_line = _normalize_name(line)
+        score = _similarity(norm_line, norm_expected)
         if score > best_score:
-            best_line, best_score = line, score
-    return {"expected": expected_name, "best_match_line": best_line, "score": best_score}
+            best_line, best_score, best_norm = line, score, norm_line
+    return {
+        "expected": expected_name,
+        "best_match_line": best_line,
+        "score": best_score,
+        "match": best_score >= NAME_MATCH_THRESHOLD,
+        "differences": _diff_fragments(best_norm, norm_expected),
+    }
 
 
 def validate_image(path, side_override=None, expected_name=None, expected_ic_no=None):
@@ -425,14 +458,14 @@ def validate_image(path, side_override=None, expected_name=None, expected_ic_no=
         100.0 if fields["nric_number"] is not None else 0.0,
         100.0 if fields["nric_date_valid"] else 0.0,
     )
-    score = round(sum(sub_scores) / len(sub_scores), 1)
+    overall_score = round(sum(sub_scores) / len(sub_scores), 1)
     # ponytail: aspect ratio is the "is this even a properly cropped card"
     # signal, not just another input to average in -- a bad crop shouldn't be
     # maskable by four perfect unrelated scores (seen on samples/OIP_1.webp:
     # aspect_score 35.6 but a 87.1 blended average). Gate it: the overall
     # score can't exceed aspect_ratio's own score once it fails.
     if not aspect["pass"]:
-        score = round(min(score, aspect["score"]), 1)
+        overall_score = round(min(overall_score, aspect["score"]), 1)
 
     result = {
         "file": str(path),
@@ -452,7 +485,7 @@ def validate_image(path, side_override=None, expected_name=None, expected_ic_no=
             "blur": blur,
             "color": color,
         },
-        "score": score,
+        "overall_score": overall_score,
     }
 
     # match: only computed when the caller supplies what they expected to

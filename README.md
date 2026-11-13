@@ -19,6 +19,7 @@ The Dockerfile trusts a local FortiGate TLS-inspection CA cert to reach PyPI/apt
 ./run.sh samples/                        # every image in the folder
 ./run.sh samples/sample.jpg --side front # trust a front-end-supplied side instead of guessing
 ./run.sh samples/sample.jpg --expected-name "Ahmad Bin Ali" --expected-ic-no "900115145523" # match against what the user claims
+./run.sh samples/sample.jpg --side front --expected-name "Ahmad Bin Ali" --expected-ic-no "900115145523" # all three combined
 ```
 
 Drop your own MyKad image into `samples/` (the shipped `sample.jpg` is a synthetic demo, not a real card).
@@ -27,7 +28,7 @@ Drop your own MyKad image into `samples/` (the shipped `sample.jpg` is a synthet
 
 A photo containing **both** sides of the card in one shot is rejected outright (`error` field, see below), not split — have the front-end collect front and back as two separate uploads instead.
 
-`--expected-name`/`--expected-ic-no` are for checking the OCR'd card against what the uploader *claims* (e.g. a name/IC already on an application form) — separate from `score`, which only measures image quality. Give either or both; the result gets a `match` key only when at least one was given (see Output below).
+`--expected-name`/`--expected-ic-no` are for checking the OCR'd card against what the uploader *claims* (e.g. a name/IC already on an application form) — separate from `overall_score`, which only measures image quality. Give either or both; the result gets a `match` key only when at least one was given (see Output below).
 
 ## Output
 
@@ -42,8 +43,8 @@ JSON per image (or `{"file": ..., "error": "..."}` if the image can't be read or
 | `raw_text` | everything OCR found anywhere on the whole image, unfiltered — no watermark keyword matching (a fixed list can't cover arbitrary custom text like "FOR TAKAFUL USAGE ONLY"), eyeball this for anything that shouldn't be there instead |
 | `ocr_accuracy` | average OCR word confidence (0-100) |
 | `checks` | all the image-quality signals, each with its own 0-100 `score` — not a cliff-edge pass/fail, so a near-miss reads differently from a wildly-off photo: `side_confidence` (front/back template-match scores), `aspect_ratio` (whole-image ratio vs. CR80 standard 1.586, assumes the front-end already cropped to just the card — 100 at a perfect match, 50 exactly at the pass/fail tolerance boundary, dropping well below 50 the further off it gets), `blur` (Laplacian variance vs. threshold — 100 at/past threshold, scaled down below it), `color` (mean HSV saturation vs. threshold, catches grayscale scans — same shape as `blur`) |
-| `score` | 0-100, the average of `aspect_ratio`/`blur`/`color`'s own `score` plus NRIC found and NRIC date valid (each 100 or 0, no continuous measure for those two) — the single top-line number. **Gated**: if `aspect_ratio.pass` is false, `score` is capped at `aspect_ratio`'s own score, since a badly-cropped image shouldn't be maskable by four unrelated perfect scores. No watermark check (front-end's job, see below) |
-| `match` | only present if `--expected-name`/`--expected-ic-no` were given: `name` (`best_match_line` — whichever line of `text` matched best — and a 0-100 `score`) and/or `ic_no` (`actual`, a 0-100 `score`, and a boolean `match` after stripping separators from both sides) |
+| `overall_score` | 0-100, the average of `aspect_ratio`/`blur`/`color`'s own `score` plus NRIC found and NRIC date valid (each 100 or 0, no continuous measure for those two) — the single top-line number. **Gated**: if `aspect_ratio.pass` is false, `overall_score` is capped at `aspect_ratio`'s own score, since a badly-cropped image shouldn't be maskable by four unrelated perfect scores. No watermark check (front-end's job, see below) |
+| `match` | only present if `--expected-name`/`--expected-ic-no` were given: `name` (`best_match_line` — whichever line of `text` matched best, after stripping punctuation from both sides so a symbol like `'` or `/` never costs match score — a 0-100 `score`, and a boolean `match` at ≥90) and/or `ic_no` (`actual`, a 0-100 `score`, and a boolean `match` after stripping separators from both sides). Either one also gets `differences`: the exact fragments that didn't match (e.g. `{"expected": "I", "actual": null}` for a dropped letter, or `{"expected": "9", "actual": "3"}` for a wrong digit) — empty once normalized strings are identical |
 
 ## How front/back and gen6/gen7 are detected
 
@@ -67,7 +68,7 @@ This tool only validates an image that's already been prepared right — none of
 | Handle a rejected combined photo | If the user submits one photo with both sides in it, this tool returns `{"error": "..."}` instead of a result — catch that and ask them to split it | "Please upload the front and back as two separate photos" |
 
 After getting a result back, two more things worth doing client-side, since this tool is heuristic, not a human:
-- Use `score` and `checks` to drive a simple "looks good" vs. "retake photo" prompt (a low `blur`/`color`/`aspect_ratio` sub-score points at *why* to retake).
+- Use `overall_score` and `checks` to drive a simple "looks good" vs. "retake photo" prompt (a low `blur`/`color`/`aspect_ratio` sub-score points at *why* to retake).
 - Show `nric_number` and `text` back to the user to confirm or correct before trusting them — a digit misread (e.g. `860109` read as `360109`) still looks like a perfectly valid NRIC to this tool's checks, so only the person looking at their own card can catch that.
 
 ## Limitations
