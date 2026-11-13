@@ -18,6 +18,7 @@ The Dockerfile trusts a local FortiGate TLS-inspection CA cert to reach PyPI/apt
 ./run.sh samples/sample.jpg              # single file, auto-detect side
 ./run.sh samples/                        # every image in the folder
 ./run.sh samples/sample.jpg --side front # trust a front-end-supplied side instead of guessing
+./run.sh samples/sample.jpg --expected-name "Ahmad Bin Ali" --expected-ic-no "900115145523" # match against what the user claims
 ```
 
 Drop your own MyKad image into `samples/` (the shipped `sample.jpg` is a synthetic demo, not a real card).
@@ -25,6 +26,8 @@ Drop your own MyKad image into `samples/` (the shipped `sample.jpg` is a synthet
 `--side front|back` is meant for a front-end that already asks the user before upload — it skips `classify_side`'s template-match guess (the least-tested part of this pipeline). Cropping and rotation need no backend flag: do them client-side before the image reaches this tool, and reject uploads whose aspect ratio is obviously wrong before they're even sent.
 
 A photo containing **both** sides of the card in one shot is rejected outright (`error` field, see below), not split — have the front-end collect front and back as two separate uploads instead.
+
+`--expected-name`/`--expected-ic-no` are for checking the OCR'd card against what the uploader *claims* (e.g. a name/IC already on an application form) — separate from `score`, which only measures image quality. Give either or both; the result gets a `match` key only when at least one was given (see Output below).
 
 ## Output
 
@@ -40,6 +43,7 @@ JSON per image (or `{"file": ..., "error": "..."}` if the image can't be read or
 | `ocr_accuracy` | average OCR word confidence (0-100) |
 | `checks` | all the image-quality signals, each with its own 0-100 `score` — not a cliff-edge pass/fail, so a near-miss reads differently from a wildly-off photo: `side_confidence` (front/back template-match scores), `aspect_ratio` (whole-image ratio vs. CR80 standard 1.586, assumes the front-end already cropped to just the card — 100 at a perfect match, 50 exactly at the pass/fail tolerance boundary, dropping well below 50 the further off it gets), `blur` (Laplacian variance vs. threshold — 100 at/past threshold, scaled down below it), `color` (mean HSV saturation vs. threshold, catches grayscale scans — same shape as `blur`) |
 | `score` | 0-100, the average of `aspect_ratio`/`blur`/`color`'s own `score` plus NRIC found and NRIC date valid (each 100 or 0, no continuous measure for those two) — the single top-line number. **Gated**: if `aspect_ratio.pass` is false, `score` is capped at `aspect_ratio`'s own score, since a badly-cropped image shouldn't be maskable by four unrelated perfect scores. No watermark check (front-end's job, see below) |
+| `match` | only present if `--expected-name`/`--expected-ic-no` were given: `name` (`best_match_line` — whichever line of `text` matched best — and a 0-100 `score`) and/or `ic_no` (`actual`, a 0-100 `score`, and a boolean `match` after stripping separators from both sides) |
 
 ## How front/back and gen6/gen7 are detected
 

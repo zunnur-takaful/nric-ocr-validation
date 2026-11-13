@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CLI: validate NRIC (MyKad) image uploads. See nric-image-validation-tools.md."""
 import argparse
+import difflib
 import json
 import re
 import sys
@@ -341,7 +342,40 @@ def parse_fields(ocr_text):
     return {"nric_number": nric_number, "nric_date_valid": date_valid, "text": text}
 
 
-def validate_image(path, side_override=None):
+def _similarity(a, b):
+    """0-100 fuzzy match via stdlib difflib -- good enough to flag "probably
+    an OCR misread" vs. "a different person/IC entirely", without pulling in
+    a fuzzy-matching dependency for what's just a sanity check, not identity
+    verification."""
+    if not a or not b:
+        return 0.0
+    return round(100.0 * difflib.SequenceMatcher(None, a, b).ratio(), 1)
+
+
+def match_expected_ic_no(nric_number, expected_ic_no):
+    actual_digits = re.sub(r"\D", "", nric_number or "")
+    expected_digits = re.sub(r"\D", "", expected_ic_no)
+    return {
+        "expected": expected_ic_no, "actual": nric_number,
+        "score": _similarity(actual_digits, expected_digits),
+        "match": bool(actual_digits) and actual_digits == expected_digits,
+    }
+
+
+def match_expected_name(text, expected_name):
+    # ponytail: `text` merges name+address with no layout model to split them
+    # (see parse_fields), so compare line-by-line and take the best match
+    # instead of fuzzy-matching the whole blob against just the name.
+    lines = [l.strip() for l in (text or "").split("/")]
+    best_line, best_score = None, 0.0
+    for line in lines:
+        score = _similarity(line.upper(), expected_name.upper())
+        if score > best_score:
+            best_line, best_score = line, score
+    return {"expected": expected_name, "best_match_line": best_line, "score": best_score}
+
+
+def validate_image(path, side_override=None, expected_name=None, expected_ic_no=None):
     image = cv2.imread(str(path))
     if image is None:
         return {"file": str(path), "error": "could not read image"}
@@ -400,7 +434,7 @@ def validate_image(path, side_override=None):
     if not aspect["pass"]:
         score = round(min(score, aspect["score"]), 1)
 
-    return {
+    result = {
         "file": str(path),
         "side": classification["side"],
         "generation": generation,
@@ -421,6 +455,19 @@ def validate_image(path, side_override=None):
         "score": score,
     }
 
+    # match: only computed when the caller supplies what they expected to
+    # see -- e.g. an application form's declared name/IC -- scored separately
+    # from `score` above, since this isn't an image-quality signal.
+    match = {}
+    if expected_name:
+        match["name"] = match_expected_name(fields["text"], expected_name)
+    if expected_ic_no:
+        match["ic_no"] = match_expected_ic_no(fields["nric_number"], expected_ic_no)
+    if match:
+        result["match"] = match
+
+    return result
+
 
 def collect_images(path):
     p = Path(path)
@@ -438,6 +485,8 @@ def main():
         "that already asks the user). Applies to every image in a folder run, so use a single-file run per side "
         "if you're processing a mixed batch.",
     )
+    parser.add_argument("--expected-name", default=None, help="Name to match the OCR'd text against (e.g. from an application form).")
+    parser.add_argument("--expected-ic-no", default=None, help="IC/NRIC number to match the OCR'd number against.")
     args = parser.parse_args()
 
     images = collect_images(args.path)
@@ -445,7 +494,10 @@ def main():
         print(f"No images found at {args.path}", file=sys.stderr)
         sys.exit(1)
 
-    results = [validate_image(img, side_override=args.side) for img in images]
+    results = [
+        validate_image(img, side_override=args.side, expected_name=args.expected_name, expected_ic_no=args.expected_ic_no)
+        for img in images
+    ]
     print(json.dumps(results[0] if len(results) == 1 else results, indent=2))
 
 

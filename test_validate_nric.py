@@ -10,6 +10,8 @@ from validate_nric import (
     classify_generation,
     classify_side,
     is_valid_nric_date,
+    match_expected_ic_no,
+    match_expected_name,
     parse_fields,
     validate_image,
 )
@@ -58,5 +60,18 @@ assert result["side"] == "back", result
 # a genuine front+back-in-one-photo upload must be rejected, not split.
 result = validate_image("samples/OIP_6.jpg")
 assert "error" in result, result
+
+assert match_expected_ic_no("900115-14-5523", "900115145523")["match"] is True  # separators shouldn't matter
+assert match_expected_ic_no("900115-14-5523", "900115-14-5529")["match"] is False
+assert match_expected_ic_no("900115-14-5523", "900115-14-5529")["score"] > 80  # still close, just one digit off
+
+name = match_expected_name("AHMAD BIN ALI / NO 12 JALAN BUNGA", "Ahmad Bin Ali")
+assert name["best_match_line"] == "AHMAD BIN ALI", name
+assert name["score"] > 95, name
+
+# end to end: validate_image should surface the same thing under "match".
+result = validate_image("samples/sample.jpg", expected_name="Ahmad Bin Ali", expected_ic_no="900115145523")
+assert result["match"]["ic_no"]["match"] is True, result["match"]
+assert result["match"]["name"]["score"] > 95, result["match"]
 
 print("OK")
